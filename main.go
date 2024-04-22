@@ -8,11 +8,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -20,21 +21,54 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/eclipse/paho.golang/autopaho"
 	"github.com/eclipse/paho.golang/autopaho/queue/file"
 	"github.com/eclipse/paho.golang/paho"
 	"github.com/justinas/alice"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 )
 
+type monitoredContainers struct {
+	nameToId map[string]string
+	mu       sync.RWMutex
+}
+
+func (mc *monitoredContainers) add(name string, id string) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	mc.nameToId[name] = id
+}
+
+func (mc *monitoredContainers) del(name string) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	delete(mc.nameToId, name)
+}
+
+func (mc *monitoredContainers) isMonitored(name string) bool {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	if _, ok := mc.nameToId[name]; ok {
+		return true
+	}
+
+	return false
+}
+
 type purgeMessage struct {
-	URL    *url.URL
-	Header http.Header
-	Sender string
+	URL           *url.URL
+	Header        http.Header
+	Sender        string
+	ContainerName string
 }
 
 func messagePublisher(ctx context.Context, wg *sync.WaitGroup, payloadChan chan []byte, logger zerolog.Logger, cm *autopaho.ConnectionManager, pubTopic string) {
@@ -143,39 +177,177 @@ func sendLocalPurge(ctx context.Context, wg *sync.WaitGroup, logger zerolog.Logg
 	}
 }
 
-func varnishlogReader(ctx context.Context, wg *sync.WaitGroup, msgChan chan []byte, logger zerolog.Logger, sender string, debug bool) {
+func containerMonitor(ctx context.Context, wg *sync.WaitGroup, msgChan chan []byte, logger zerolog.Logger, sender string, debug bool, dockerClient *client.Client) {
 	wg.Add(1)
 	defer wg.Done()
 
-	purgesSent := promauto.NewCounter(prometheus.CounterOpts{
-		Name: "sunet_cdnp_purge_notifies_sent_total",
-		Help: "The total number of purge notifies sent",
-	})
+	ticker := time.NewTicker(time.Second * 10)
+	defer ticker.Stop()
 
-	cmd := exec.CommandContext(ctx, "varnishlog", "-n", "/var/lib/varnish/varnishd", "-q", `ReqMethod eq "PURGE" and RespStatus == 200 and ReqURL`, "-i", "Begin,ReqHeader,ReqURL,ReqStart,End")
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		logger.Fatal().Err(err).Msg("unable to create stdout pipe")
+	// Keep track of currently monitored containers in a name -> ID mapping
+	mc := &monitoredContainers{
+		nameToId: map[string]string{},
 	}
 
-	// If we do not setup a custom cmd.Cancel the call to cmd.Wait() will throw
-	// an "context canceled" error if ctx is cancelled.
-	cmd.Cancel = func() error {
-		err = cmd.Process.Signal(syscall.SIGTERM)
+monitorLoop:
+	for {
+		containers, err := dockerClient.ContainerList(context.Background(), container.ListOptions{})
 		if err != nil {
-			logger.Error().Err(err).Msg("sending signal failed")
+			logger.Error().Err(err).Msg("unable to list containers")
+			continue
+		}
+
+		// Now start a varnishlog parser for each container matching our naming convention.
+		for _, ctr := range containers {
+			for _, name := range ctr.Names {
+				// The docker API returns names with a leading
+				// slash ("/"), which is not visible when
+				// running `docker ps`, lets trim that
+				// here as well to look the same.
+				name = strings.TrimPrefix(name, "/")
+
+				if strings.HasPrefix(name, "sunet-cdn-") && strings.Contains(name, "-varnish-") {
+					if !mc.isMonitored(name) {
+						logger.Info().Str("name", name).Str("id", ctr.ID).Str("image", ctr.Image).Str("status", ctr.Status).Msg("found unmonitored SUNET CDN varnish container, starting varnishlog")
+						mc.add(name, ctr.ID)
+						go varnishlogReader(ctx, name, ctr.ID, wg, msgChan, logger, sender, debug, dockerClient, mc)
+					}
+				}
+			}
+		}
+
+		// Wait some time before the next iteration or exit if a signal
+		// has been received.
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			break monitorLoop
+		}
+	}
+}
+
+// https://stackoverflow.com/questions/52774830/docker-exec-command-from-golang-api
+// https://github.com/moby/moby/blob/8e610b2b55bfd1bfa9436ab110d311f5e8a74dcb/integration/internal/container/exec.go#L38
+func dockerExec(ctx context.Context, cli client.APIClient, id string, cmd []string, logger zerolog.Logger, debug bool, msgChan chan []byte, sender string, containerName string) error {
+	execConfig := types.ExecConfig{
+		AttachStdout: true,
+		AttachStderr: true,
+		Cmd:          cmd,
+		// There is no way in the docker exec API to stop a started
+		// "exec process":
+		// https://github.com/moby/moby/issues/9098
+		//
+		// We want a way to tell a started process to stop if we
+		// are shutting down, otherwise they will be left running in
+		// the container forever.
+		//
+		// Since there is no way to signal the process directly via
+		// the container attachement we instead enable a TTY and attach
+		// to stdin (equivalent of running "docker exec -it"). This way
+		// we can simulate pressing Ctrl+C by sending the equivalent
+		// End-of-Text (ETX) byte (0x3) to stdin, causing the TTY to
+		// SIGINT the process for us.
+		AttachStdin: true,
+		Tty:         true,
+	}
+
+	cresp, err := cli.ContainerExecCreate(ctx, id, execConfig)
+	if err != nil {
+		return fmt.Errorf("dockerExec: unable to create exec: %w", err)
+	}
+	execID := cresp.ID
+
+	// Start the process
+	aresp, err := cli.ContainerExecAttach(ctx, execID, types.ExecStartCheck{})
+	if err != nil {
+		return fmt.Errorf("dockerExec: unable to attach to exec: %w", err)
+	}
+	defer aresp.Close()
+
+	// Have the process shut down if needed
+	defer func() {
+		iresp, err := cli.ContainerExecInspect(context.Background(), execID)
+		if err != nil {
+			logger.Error().Err(err).Msg("unable to inspect process in container")
+			return
+		}
+		if !iresp.Running {
+			// The process has already exited, no need to simulate Ctrl+C
+			return
+		}
+
+		// Simulate Ctrl+C
+		// https://en.wikipedia.org/wiki/End-of-Text_character
+		_, err = aresp.Conn.Write([]byte{0x3})
+		if err != nil {
+			logger.Error().Err(err).Msg("the process was running, but was not able to simulate Ctrl+C")
+			return
+		}
+
+		maxAttempts := 10
+		for attempt := 0; attempt < maxAttempts; attempt++ {
+			// Wait until the process has exited
+			iresp, err := cli.ContainerExecInspect(context.Background(), execID)
+			if err != nil {
+				log.Fatal(err)
+			}
+			if !iresp.Running {
+				logger.Info().Msg("the process has exited")
+				return
+			}
+			waitDuration := time.Millisecond * 250
+			logger.Info().Str("wait_duration", waitDuration.String()).Str("cmd", strings.Join(cmd, " ")).Msg("waiting on exit")
+			time.Sleep(waitDuration)
+		}
+
+		logger.Error().Int("max_attempts", maxAttempts).Str("cmd", strings.Join(cmd, " ")).Msg("gave up after waiting too many times on process")
+	}()
+
+	// read the output
+	outputDone := make(chan error)
+	parserDone := make(chan error)
+
+	pipeReader, pipeWriter := io.Pipe()
+	outScanner := bufio.NewScanner(pipeReader)
+
+	go func() {
+		// Since we write both streams to the same pipeWriter the
+		// reason we use docker stdcopy instead if io.Copy is to clean
+		// up the byte prefix of the messages added by docker StdWriter
+		_, err = stdcopy.StdCopy(pipeWriter, pipeWriter, aresp.Reader)
+
+		// Signal to scanner that we are done
+		err = pipeWriter.Close()
+		if err != nil {
+			logger.Error().Err(err).Msg("unable to close pipe")
+		}
+		outputDone <- err
+	}()
+
+	go func() {
+		err = runParser(outScanner, logger, debug, msgChan, sender, containerName)
+		parserDone <- err
+	}()
+
+	select {
+	case err := <-outputDone:
+		if err != nil {
 			return err
 		}
-		// Make cmd.Wait() not return an error
-		return os.ErrProcessDone
+		break
+
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 
-	scanner := bufio.NewScanner(stdout)
+	err = <-parserDone
 
-	err = cmd.Start()
-	if err != nil {
-		logger.Fatal().Err(err).Msg("unable to start process")
-	}
+	return nil
+}
+
+func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgChan chan []byte, sender string, containerName string) error {
+
+	var err error
 
 	// *   << Request  >> 1574921
 	// -   Begin          req 1574920 rxreq
@@ -196,7 +368,6 @@ func varnishlogReader(ctx context.Context, wg *sync.WaitGroup, msgChan chan []by
 
 	// Variables that will need to be reset any time we read a new
 	// varnishlog header, see RESET comment below.
-	pm := purgeMessage{}
 	reqURL := ""
 	header := http.Header{}
 	clientIP := netip.Addr{}
@@ -219,7 +390,6 @@ func varnishlogReader(ctx context.Context, wg *sync.WaitGroup, msgChan chan []by
 				}
 				// RESET: Reset variables for new request we
 				// are about to parse
-				pm = purgeMessage{}
 				reqURL = ""
 				header = http.Header{}
 				clientIP = netip.Addr{}
@@ -309,8 +479,11 @@ func varnishlogReader(ctx context.Context, wg *sync.WaitGroup, msgChan chan []by
 						continue
 					}
 
+					pm := purgeMessage{}
+
 					pm.Sender = sender
 					pm.Header = header
+					pm.ContainerName = containerName
 
 					urlString := ""
 
@@ -354,13 +527,15 @@ func varnishlogReader(ctx context.Context, wg *sync.WaitGroup, msgChan chan []by
 							fmt.Println(string(b))
 						}
 						msgChan <- b
-						purgesSent.Inc()
+						//purgesSent.Inc()
 					}
 
 				}
 			}
 		} else if text == "" {
 			// Do nothing, each log entry is trailed by an empty line
+		} else if text == "^C" {
+			// Do nothing, if we simulate the sending of Ctrl+C this character will appear
 		} else {
 			logger.Fatal().Str("varnishlog_line", text).Msg("found unexpected varnishlog line, exiting")
 		}
@@ -370,12 +545,27 @@ func varnishlogReader(ctx context.Context, wg *sync.WaitGroup, msgChan chan []by
 		logger.Fatal().Err(err).Msg("scanner failed")
 	}
 
-	err = cmd.Wait()
+	logger.Info().Msg("runParser: exiting")
+	return nil
+}
+
+func varnishlogReader(ctx context.Context, containerName string, containerID string, wg *sync.WaitGroup, msgChan chan []byte, logger zerolog.Logger, sender string, debug bool, dockerClient *client.Client, mc *monitoredContainers) {
+	wg.Add(1)
+	defer wg.Done()
+
+	defer func() {
+		logger.Info().Str("name", containerName).Msg("cleaning up no longer monitored container from monitoredContainers map")
+		mc.del(containerName)
+	}()
+
+	varnishlogCmd := []string{"varnishlog", "-n", "/var/lib/varnish/varnishd", "-q", `ReqMethod eq "PURGE" and RespStatus == 200 and ReqURL`, "-i", "Begin,ReqHeader,ReqURL,ReqStart,End"}
+
+	err := dockerExec(ctx, dockerClient, containerID, varnishlogCmd, logger, debug, msgChan, sender, containerName)
 	if err != nil {
-		logger.Fatal().Err(err).Msg("waiting on process failed")
+		log.Fatalf("dockerExec failed: %s", err)
 	}
 
-	logger.Info().Msg("varnishlogReader: exiting")
+	logger.Info().Str("name", containerName).Msg("varnishlogReader: exiting")
 }
 
 func setupMQTT(ctx context.Context, debug bool, logger *zerolog.Logger, logDir string, serverURL *url.URL, tlsConfig *tls.Config, subTopic string, handleLocalMessages bool) (*autopaho.ConnectionManager, chan *paho.Publish, error) {
@@ -503,6 +693,7 @@ func main() {
 	mqttQueueDir := flag.String("mqtt-queue-dir", "/var/cache/sunet-cdnp/mqtt", "MQTT message queue directory")
 	mqttPubTopic := flag.String("mqtt-pub-topic", "test/topic", "the topic we publish PURGE messages to")
 	mqttSubTopic := flag.String("mqtt-sub-topic", "test/topic", "the topic we subscribe to PURGE messages on")
+	mqttServerString := flag.String("mqtt-server", "tls://localhost:8883", "the MQTT server we connect to")
 	httpServerAddr := flag.String("http-server-addr", "127.0.0.1:2112", "Address to bind HTTP server to")
 	handleLocalMessages := flag.Bool("danger-handle-local-messages", false, "Handle messages sent by ourselves, should only be enabled for testing")
 	flag.Parse()
@@ -524,8 +715,7 @@ func main() {
 
 	newLogChain := newLogChain(logger)
 
-	serverString := "tls://localhost:8883"
-	serverURL, err := url.Parse(serverString)
+	serverURL, err := url.Parse(*mqttServerString)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("unable to parse server string")
 	}
@@ -590,7 +780,13 @@ func main() {
 	go messagePublisher(ctx, &wg, pubPayloadChan, logger, mqttCM, *mqttPubTopic)
 	go messageSubscriber(ctx, &wg, subMsgChan, logger, sender, *debug, *handleLocalMessages)
 
-	go varnishlogReader(ctx, &wg, pubPayloadChan, logger, sender, *debug)
+	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		panic(err)
+	}
+	defer dockerClient.Close()
+
+	go containerMonitor(ctx, &wg, pubPayloadChan, logger, sender, *debug, dockerClient)
 
 	http.Handle("/metrics", mh)
 
