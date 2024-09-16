@@ -72,7 +72,6 @@ type purgeMessage struct {
 }
 
 func messagePublisher(ctx context.Context, wg *sync.WaitGroup, payloadChan chan []byte, logger zerolog.Logger, cm *autopaho.ConnectionManager, pubTopic string) {
-	wg.Add(1)
 	defer wg.Done()
 
 	for payload := range payloadChan {
@@ -96,7 +95,6 @@ func messagePublisher(ctx context.Context, wg *sync.WaitGroup, payloadChan chan 
 }
 
 func messageSubscriber(ctx context.Context, wg *sync.WaitGroup, msgChan chan *paho.Publish, logger zerolog.Logger, sender string, debug bool, handleLocalMessages bool) {
-	wg.Add(1)
 	defer wg.Done()
 
 	var purgerWg sync.WaitGroup
@@ -141,6 +139,7 @@ func messageSubscriber(ctx context.Context, wg *sync.WaitGroup, msgChan chan *pa
 			}
 		}
 
+		purgerWg.Add(1)
 		go sendLocalPurge(ctx, &purgerWg, logger, purgeClient, pm)
 	}
 
@@ -153,7 +152,6 @@ func messageSubscriber(ctx context.Context, wg *sync.WaitGroup, msgChan chan *pa
 // This is the function that will be called to purge our local cache based on
 // the contents of a purge message from another cache node.
 func sendLocalPurge(ctx context.Context, wg *sync.WaitGroup, logger zerolog.Logger, purgeClient http.Client, pm purgeMessage) {
-	wg.Add(1)
 	defer wg.Done()
 
 	req, err := http.NewRequestWithContext(ctx, "PURGE", "http://127.0.0.1:6081", nil)
@@ -178,7 +176,6 @@ func sendLocalPurge(ctx context.Context, wg *sync.WaitGroup, logger zerolog.Logg
 }
 
 func containerMonitor(ctx context.Context, wg *sync.WaitGroup, msgChan chan []byte, logger zerolog.Logger, sender string, debug bool, dockerClient *client.Client) {
-	wg.Add(1)
 	defer wg.Done()
 
 	ticker := time.NewTicker(time.Second * 10)
@@ -210,6 +207,7 @@ monitorLoop:
 					if !mc.isMonitored(name) {
 						logger.Info().Str("name", name).Str("id", ctr.ID).Str("image", ctr.Image).Str("status", ctr.Status).Msg("found unmonitored SUNET CDN varnish container, starting varnishlog")
 						mc.add(name, ctr.ID)
+						wg.Add(1)
 						go varnishlogReader(ctx, name, ctr.ID, wg, msgChan, logger, sender, debug, dockerClient, mc)
 					}
 				}
@@ -550,7 +548,6 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 }
 
 func varnishlogReader(ctx context.Context, containerName string, containerID string, wg *sync.WaitGroup, msgChan chan []byte, logger zerolog.Logger, sender string, debug bool, dockerClient *client.Client, mc *monitoredContainers) {
-	wg.Add(1)
 	defer wg.Done()
 
 	defer func() {
@@ -777,7 +774,9 @@ func main() {
 
 	var wg sync.WaitGroup
 
+	wg.Add(1)
 	go messagePublisher(ctx, &wg, pubPayloadChan, logger, mqttCM, *mqttPubTopic)
+	wg.Add(1)
 	go messageSubscriber(ctx, &wg, subMsgChan, logger, sender, *debug, *handleLocalMessages)
 
 	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -786,6 +785,7 @@ func main() {
 	}
 	defer dockerClient.Close()
 
+	wg.Add(1)
 	go containerMonitor(ctx, &wg, pubPayloadChan, logger, sender, *debug, dockerClient)
 
 	http.Handle("/metrics", mh)
