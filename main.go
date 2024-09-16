@@ -21,7 +21,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
@@ -227,7 +226,7 @@ monitorLoop:
 // https://stackoverflow.com/questions/52774830/docker-exec-command-from-golang-api
 // https://github.com/moby/moby/blob/8e610b2b55bfd1bfa9436ab110d311f5e8a74dcb/integration/internal/container/exec.go#L38
 func dockerExec(ctx context.Context, cli client.APIClient, id string, cmd []string, logger zerolog.Logger, debug bool, msgChan chan []byte, sender string, containerName string) error {
-	execConfig := types.ExecConfig{
+	execConfig := container.ExecOptions{
 		AttachStdout: true,
 		AttachStderr: true,
 		Cmd:          cmd,
@@ -256,7 +255,7 @@ func dockerExec(ctx context.Context, cli client.APIClient, id string, cmd []stri
 	execID := cresp.ID
 
 	// Start the process
-	aresp, err := cli.ContainerExecAttach(ctx, execID, types.ExecStartCheck{})
+	aresp, err := cli.ContainerExecAttach(ctx, execID, container.ExecAttachOptions{})
 	if err != nil {
 		return fmt.Errorf("dockerExec: unable to attach to exec: %w", err)
 	}
