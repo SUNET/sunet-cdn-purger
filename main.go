@@ -79,7 +79,8 @@ func messagePublisher(ctx context.Context, wg *sync.WaitGroup, payloadChan chan 
 				QoS:     1,
 				Topic:   pubTopic,
 				Payload: payload,
-			}}); err != nil {
+			},
+		}); err != nil {
 			logger.Error().Err(err).Msg("failed queueing message")
 		}
 
@@ -174,7 +175,7 @@ func sendLocalPurge(ctx context.Context, wg *sync.WaitGroup, logger zerolog.Logg
 	}
 }
 
-func containerMonitor(ctx context.Context, wg *sync.WaitGroup, msgChan chan []byte, logger zerolog.Logger, sender string, debug bool, dockerClient *client.Client) {
+func containerMonitor(ctx context.Context, wg *sync.WaitGroup, msgChan chan []byte, logger zerolog.Logger, sender string, debug bool, dockerClient *client.Client, containerPrefix string, containerQualifier string) {
 	defer wg.Done()
 
 	ticker := time.NewTicker(time.Second * 10)
@@ -202,7 +203,7 @@ monitorLoop:
 				// here as well to look the same.
 				name = strings.TrimPrefix(name, "/")
 
-				if strings.HasPrefix(name, "sunet-cdn-") && strings.Contains(name, "-varnish-") {
+				if strings.HasPrefix(name, containerPrefix) && strings.Contains(name, containerQualifier) {
 					if !mc.isMonitored(name) {
 						logger.Info().Str("name", name).Str("id", ctr.ID).Str("image", ctr.Image).Str("status", ctr.Status).Msg("found unmonitored SUNET CDN varnish container, starting varnishlog")
 						mc.add(name, ctr.ID)
@@ -343,7 +344,6 @@ func dockerExec(ctx context.Context, cli client.APIClient, id string, cmd []stri
 }
 
 func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgChan chan []byte, sender string, containerName string) error {
-
 	var err error
 
 	// *   << Request  >> 1574921
@@ -524,7 +524,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 							fmt.Println(string(b))
 						}
 						msgChan <- b
-						//purgesSent.Inc()
+						// purgesSent.Inc()
 					}
 
 				}
@@ -608,7 +608,8 @@ func setupMQTT(ctx context.Context, debug bool, logger *zerolog.Logger, logDir s
 				func(pr paho.PublishReceived) (bool, error) {
 					subChan <- pr.Packet
 					return true, nil
-				}},
+				},
+			},
 			OnClientError: func(err error) { logger.Error().Err(err).Msg("pubsub: client error") },
 			OnServerDisconnect: func(d *paho.Disconnect) {
 				if d.Properties != nil {
@@ -639,7 +640,6 @@ func setupMQTT(ctx context.Context, debug bool, logger *zerolog.Logger, logDir s
 	}
 
 	return c, subChan, nil
-
 }
 
 func newLogChain(logger zerolog.Logger) alice.Chain {
@@ -692,6 +692,8 @@ func main() {
 	mqttServerString := flag.String("mqtt-server", "tls://localhost:8883", "the MQTT server we connect to")
 	httpServerAddr := flag.String("http-server-addr", "127.0.0.1:2112", "Address to bind HTTP server to")
 	handleLocalMessages := flag.Bool("danger-handle-local-messages", false, "Handle messages sent by ourselves, should only be enabled for testing")
+	containerPrefix := flag.String("container-prefix", "cdn-cache-", "Container name prefix for things we attach varnishlog to")
+	containerQualifier := flag.String("container-qualifier", "-varnish-", "Additional container name contents for things we attach varnishlog to")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -737,7 +739,7 @@ func main() {
 	}
 
 	// Make sure the queue dir exists
-	err = os.MkdirAll(*mqttQueueDir, 0750)
+	err = os.MkdirAll(*mqttQueueDir, 0o750)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("unable to create MQTT queue directory")
 	}
@@ -785,7 +787,7 @@ func main() {
 	defer dockerClient.Close()
 
 	wg.Add(1)
-	go containerMonitor(ctx, &wg, pubPayloadChan, logger, sender, *debug, dockerClient)
+	go containerMonitor(ctx, &wg, pubPayloadChan, logger, sender, *debug, dockerClient, *containerPrefix, *containerQualifier)
 
 	http.Handle("/metrics", mh)
 
