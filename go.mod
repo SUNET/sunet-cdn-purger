@@ -1,6 +1,6 @@
 module sunet-cdnp
 
-go 1.23.1
+go 1.23.2
 
 require (
 	github.com/docker/docker v27.2.1+incompatible
