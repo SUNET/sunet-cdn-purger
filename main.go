@@ -376,6 +376,10 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 			fmt.Printf("varnishlog line: %s\n", text)
 		}
 		if strings.HasPrefix(text, "*") {
+			if seenHeader {
+				logger.Fatal().Msg("found new varnishlog header before seeing 'End' of previous entry, this is odd")
+			}
+
 			if debug {
 				logger.Debug().Msg("found varnishlog header, resetting variables")
 			}
