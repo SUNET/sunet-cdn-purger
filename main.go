@@ -365,9 +365,9 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 
 	// Variables that will need to be reset any time we read a new
 	// varnishlog header, see RESET comment below.
-	reqURL := ""
-	header := http.Header{}
-	clientIP := netip.Addr{}
+	var reqURL string
+	var header http.Header
+	var clientIP netip.Addr
 
 	seenHeader := false
 	for scanner.Scan() {
@@ -376,21 +376,16 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 			fmt.Printf("varnishlog line: %s\n", text)
 		}
 		if strings.HasPrefix(text, "*") {
-			if !seenHeader {
-				if debug {
-					logger.Debug().Msg("found initial header")
-				}
-				seenHeader = true
-			} else {
-				if debug {
-					logger.Debug().Msg("found next varnishlog header, resetting variables")
-				}
-				// RESET: Reset variables for new request we
-				// are about to parse
-				reqURL = ""
-				header = http.Header{}
-				clientIP = netip.Addr{}
+			if debug {
+				logger.Debug().Msg("found varnishlog header, resetting variables")
 			}
+			seenHeader = true
+
+			// RESET: Reset variables for new request we
+			// are about to parse
+			reqURL = ""
+			header = http.Header{}
+			clientIP = netip.Addr{}
 		} else if strings.HasPrefix(text, "-") {
 			if !seenHeader {
 				logger.Fatal().Msg("got log message without seeing header first, this is odd")
@@ -458,11 +453,12 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 					// The entry is complete, finish
 					// filling in struct and send it to
 					// MQTT.
+					seenHeader = false
 					if clientIP.IsLoopback() {
 						// In order to not create loops
 						// we ignore PURGE requests
 						// that come from our own
-						// machine as this is could be
+						// machine as this could be
 						// a purge request sent by this
 						// process in response to a
 						// MQTT message from someone else.
