@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -560,7 +561,9 @@ func varnishlogReader(ctx context.Context, containerName string, containerID str
 
 	err := dockerExec(ctx, dockerClient, containerID, varnishlogCmd, logger, debug, msgChan, sender, containerName)
 	if err != nil {
-		log.Fatalf("dockerExec failed: %s", err)
+		if !errors.Is(err, context.Canceled) {
+			logger.Fatal().Err(err).Msg("dockerExec failed")
+		}
 	}
 
 	logger.Info().Str("name", containerName).Msg("varnishlogReader: exiting")
