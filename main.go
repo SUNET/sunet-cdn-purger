@@ -342,6 +342,9 @@ func dockerExec(ctx context.Context, cli client.APIClient, id string, cmd []stri
 	}
 
 	err = <-parserDone
+	if err != nil {
+		return fmt.Errorf("parserDone returned error: %w", err)
+	}
 
 	return nil
 }
