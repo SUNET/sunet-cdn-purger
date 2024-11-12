@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -27,6 +28,7 @@ import (
 	"github.com/eclipse/paho.golang/autopaho"
 	"github.com/eclipse/paho.golang/autopaho/queue/file"
 	"github.com/eclipse/paho.golang/paho"
+	"github.com/fsnotify/fsnotify"
 	"github.com/justinas/alice"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
@@ -681,6 +683,36 @@ func certPoolFromFile(fileName string) (*x509.CertPool, error) {
 	return certPool, nil
 }
 
+type certStore struct {
+	mutex      sync.RWMutex
+	clientCert *tls.Certificate
+}
+
+func (cs *certStore) setClientCertificate(certFile string, keyFile string) error {
+	// Setup client cert/key for mTLS authentication
+	clientCert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return fmt.Errorf("unable to load x509 MQTT client cert: %w", err)
+	}
+
+	cs.mutex.Lock()
+	cs.clientCert = &clientCert
+	cs.mutex.Unlock()
+
+	return nil
+}
+
+func (cs *certStore) getClientCertificate(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	cs.mutex.RLock()
+	defer cs.mutex.RUnlock()
+
+	return cs.clientCert, nil
+}
+
+func newCertStore() *certStore {
+	return &certStore{}
+}
+
 func main() {
 	debug := flag.Bool("debug", false, "enable debug logging")
 	mqttClientCertFile := flag.String("mqtt-client-cert-file", "", "MQTT client cert file")
@@ -722,9 +754,84 @@ func main() {
 	var mqttCACertPool *x509.CertPool
 
 	// Setup client cert/key for mTLS authentication
-	mqttClientCert, err := tls.LoadX509KeyPair(*mqttClientCertFile, *mqttClientKeyFile)
+	cs := newCertStore()
+	err = cs.setClientCertificate(*mqttClientCertFile, *mqttClientKeyFile)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("unable to load x509 MQTT client cert")
+	}
+
+	// Create new watcher.
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		logger.Fatal().Err(err).Msg("unable to create fsnotify watcher")
+	}
+	defer watcher.Close()
+
+	// Start listening for events.
+	go func() {
+		// Event dedup based on https://github.com/fsnotify/fsnotify/blob/main/cmd/fsnotify/dedup.go
+		var mutex sync.Mutex
+		timers := make(map[string]*time.Timer)
+
+		callback := func(e fsnotify.Event) {
+			if e.Name == *mqttClientCertFile {
+				logger.Info().Msg("reloading MQTT client certificate")
+				err := cs.setClientCertificate(*mqttClientCertFile, *mqttClientKeyFile)
+				if err != nil {
+					logger.Err(err).Msg("reloading MQTT client certificate failed")
+				}
+			}
+
+			mutex.Lock()
+			delete(timers, e.Name)
+			mutex.Unlock()
+		}
+
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+
+				if !event.Has(fsnotify.Write) && !event.Has(fsnotify.Create) {
+					continue
+				}
+
+				// Get timer.
+				mutex.Lock()
+				t, ok := timers[event.Name]
+				mutex.Unlock()
+
+				// No timer exists, create it and stop it from running.
+				if !ok {
+					t = time.AfterFunc(math.MaxInt64, func() { callback(event) })
+					t.Stop()
+
+					mutex.Lock()
+					timers[event.Name] = t
+					mutex.Unlock()
+				}
+
+				// Reset the timer for this path so it will
+				// run callback() in 100ms. If additional
+				// events appear for the same file we will keep
+				// resetting the timer.
+				t.Reset(100 * time.Millisecond)
+
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				logger.Err(err).Msg("watcher error")
+			}
+		}
+	}()
+
+	// Add a path.
+	err = watcher.Add(filepath.Dir(*mqttClientCertFile))
+	if err != nil {
+		logger.Fatal().Err(err).Str("dir", filepath.Dir(*mqttClientCertFile)).Msg("unable to add fsnotify dir")
 	}
 
 	mqttCACertPool, err = certPoolFromFile(*mqttCAFile)
@@ -733,9 +840,9 @@ func main() {
 	}
 
 	tlsCfg := &tls.Config{
-		RootCAs:      mqttCACertPool,
-		Certificates: []tls.Certificate{mqttClientCert},
-		MinVersion:   tls.VersionTLS13,
+		RootCAs:              mqttCACertPool,
+		GetClientCertificate: cs.getClientCertificate,
+		MinVersion:           tls.VersionTLS13,
 	}
 
 	// Make sure the queue dir exists
