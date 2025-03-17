@@ -540,7 +540,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 		} else if text == "^C" {
 			// Do nothing, if we simulate the sending of Ctrl+C this character will appear
 		} else {
-			logger.Fatal().Str("varnishlog_line", text).Msg("found unexpected varnishlog line, exiting")
+			logger.Error().Str("varnishlog_line", text).Msg("found unexpected varnishlog line")
 		}
 	}
 
