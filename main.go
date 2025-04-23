@@ -611,7 +611,7 @@ func setupMQTT(ctx context.Context, debug bool, logger *zerolog.Logger, logDir s
 		PahoErrors:     &pahoErrorLogger,
 		// eclipse/paho.golang/paho provides base mqtt functionality, the below config will be passed in for each connection
 		ClientConfig: paho.ClientConfig{
-			ClientID: "sunet-cdnp-pubsub",
+			ClientID: "sunet-cdn-purger-pubsub",
 			OnPublishReceived: []func(paho.PublishReceived) (bool, error){
 				func(pr paho.PublishReceived) (bool, error) {
 					subChan <- pr.Packet
@@ -724,7 +724,7 @@ func main() {
 	mqttClientCertFile := flag.String("mqtt-client-cert-file", "", "MQTT client cert file")
 	mqttClientKeyFile := flag.String("mqtt-client-key-file", "", "MQTT client key file")
 	mqttCAFile := flag.String("mqtt-ca-file", "", "MQTT trusted CA file, leave empty for OS default")
-	mqttQueueDir := flag.String("mqtt-queue-dir", "/var/cache/sunet-cdnp/mqtt", "MQTT message queue directory")
+	mqttQueueDir := flag.String("mqtt-queue-dir", "/var/cache/sunet-cdn-purger/mqtt", "MQTT message queue directory")
 	mqttPubTopic := flag.String("mqtt-pub-topic", "test/topic", "the topic we publish PURGE messages to")
 	mqttSubTopic := flag.String("mqtt-sub-topic", "test/topic", "the topic we subscribe to PURGE messages on")
 	mqttServerString := flag.String("mqtt-server", "tls://localhost:8883", "the MQTT server we connect to")
@@ -739,7 +739,7 @@ func main() {
 
 	logger := zerolog.New(os.Stdout).With().
 		Timestamp().
-		Str("service", "sunet-cdnp").
+		Str("service", "sunet-cdn-purger").
 		Logger()
 
 	sender, err := os.Hostname()

@@ -1,4 +1,4 @@
-module sunet-cdnp
+module sunet-cdn-purger
 
 go 1.23.2
 
