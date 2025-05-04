@@ -730,7 +730,7 @@ func main() {
 	mqttServerString := flag.String("mqtt-server", "tls://localhost:8883", "the MQTT server we connect to")
 	httpServerAddr := flag.String("http-server-addr", "127.0.0.1:2112", "Address to bind HTTP server to")
 	handleLocalMessages := flag.Bool("danger-handle-local-messages", false, "Handle messages sent by ourselves, should only be enabled for testing")
-	containerPrefix := flag.String("container-prefix", "sunet-cdn-agent-cache-", "Container name prefix for things we attach varnishlog to")
+	containerPrefix := flag.String("container-prefix", "sunet-cdn-agent_cache_", "Container name prefix for things we attach varnishlog to")
 	containerQualifier := flag.String("container-qualifier", "-varnish-", "Additional container name contents for things we attach varnishlog to")
 	flag.Parse()
 
