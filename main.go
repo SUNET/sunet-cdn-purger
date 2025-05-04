@@ -771,7 +771,12 @@ func main() {
 	if err != nil {
 		logger.Fatal().Err(err).Msg("unable to create fsnotify watcher")
 	}
-	defer watcher.Close()
+	defer func() {
+		err := watcher.Close()
+		if err != nil {
+			logger.Err(err).Msg("unable to close watcher")
+		}
+	}()
 
 	// Start listening for events.
 	go func() {
@@ -897,7 +902,12 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer dockerClient.Close()
+	defer func() {
+		err := dockerClient.Close()
+		if err != nil {
+			logger.Err(err).Msg("unable to close dockerClient")
+		}
+	}()
 
 	wg.Add(1)
 	go containerMonitor(ctx, &wg, pubPayloadChan, logger, sender, *debug, dockerClient, *containerPrefix, *containerQualifier)
