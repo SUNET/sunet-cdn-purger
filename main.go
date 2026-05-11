@@ -286,7 +286,7 @@ func dockerExec(ctx context.Context, cli client.APIClient, id string, cmd []stri
 		}
 
 		maxAttempts := 10
-		for attempt := 0; attempt < maxAttempts; attempt++ {
+		for range maxAttempts {
 			// Wait until the process has exited
 			iresp, err := cli.ContainerExecInspect(context.Background(), execID)
 			if err != nil {
