@@ -1,6 +1,6 @@
 module sunet-cdn-purger
 
-go 1.23.2
+go 1.26.3
 
 require (
 	github.com/docker/docker v28.1.1+incompatible
