@@ -572,7 +572,7 @@ func varnishlogReader(ctx context.Context, containerName string, containerID str
 	logger.Info().Str("name", containerName).Msg("varnishlogReader: exiting")
 }
 
-func setupMQTT(ctx context.Context, debug bool, logger *zerolog.Logger, logDir string, serverURL *url.URL, tlsConfig *tls.Config, subTopic string, handleLocalMessages bool) (*autopaho.ConnectionManager, chan *paho.Publish, error) {
+func setupMQTT(ctx context.Context, debug bool, logger *zerolog.Logger, logDir string, hostname string, serverURL *url.URL, tlsConfig *tls.Config, subTopic string, handleLocalMessages bool) (*autopaho.ConnectionManager, chan *paho.Publish, error) {
 	q, err := file.New(logDir, "queue", ".msg")
 	if err != nil {
 		return nil, nil, fmt.Errorf("setupMQTTPub(): unable to create file queue: %w", err)
@@ -611,7 +611,7 @@ func setupMQTT(ctx context.Context, debug bool, logger *zerolog.Logger, logDir s
 		PahoErrors:     &pahoErrorLogger,
 		// eclipse/paho.golang/paho provides base mqtt functionality, the below config will be passed in for each connection
 		ClientConfig: paho.ClientConfig{
-			ClientID: "sunet-cdn-purger-pubsub",
+			ClientID: "sunet-cdn-purger-" + hostname,
 			OnPublishReceived: []func(paho.PublishReceived) (bool, error){
 				func(pr paho.PublishReceived) (bool, error) {
 					subChan <- pr.Packet
@@ -862,7 +862,12 @@ func main() {
 		logger.Fatal().Err(err).Msg("unable to create MQTT queue directory")
 	}
 
-	mqttCM, subMsgChan, err := setupMQTT(ctx, *debug, &logger, *mqttQueueDir, serverURL, tlsCfg, *mqttSubTopic, *handleLocalMessages)
+	hostname, err := os.Hostname()
+	if err != nil {
+		logger.Fatal().Err(err).Msg("unable to lookup hostname")
+	}
+
+	mqttCM, subMsgChan, err := setupMQTT(ctx, *debug, &logger, *mqttQueueDir, hostname, serverURL, tlsCfg, *mqttSubTopic, *handleLocalMessages)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("unable to setup MQTT publisher")
 	}
