@@ -610,22 +610,20 @@ func setupMQTT(ctx context.Context, debug bool, logger *zerolog.Logger, logDir s
 		Errors:         &errorLogger,
 		PahoErrors:     &pahoErrorLogger,
 		// eclipse/paho.golang/paho provides base mqtt functionality, the below config will be passed in for each connection
-		ClientConfig: paho.ClientConfig{
-			ClientID: "sunet-cdn-purger-" + hostname,
-			OnPublishReceived: []func(paho.PublishReceived) (bool, error){
-				func(pr paho.PublishReceived) (bool, error) {
-					subChan <- pr.Packet
-					return true, nil
-				},
+		ClientID: "sunet-cdn-purger-" + hostname,
+		OnPublishReceived: []func(paho.PublishReceived) (bool, error){
+			func(pr paho.PublishReceived) (bool, error) {
+				subChan <- pr.Packet
+				return true, nil
 			},
-			OnClientError: func(err error) { logger.Error().Err(err).Msg("pubsub: client error") },
-			OnServerDisconnect: func(d *paho.Disconnect) {
-				if d.Properties != nil {
-					logger.Info().Str("reason_string", d.Properties.ReasonString).Msg("pubsub: server requested disconnect")
-				} else {
-					logger.Info().Uint8("reason_code", uint8(d.ReasonCode)).Msg("pubsub server requested disconnect")
-				}
-			},
+		},
+		OnClientError: func(err error) { logger.Error().Err(err).Msg("pubsub: client error") },
+		OnServerDisconnect: func(d *paho.Disconnect) {
+			if d.Properties != nil {
+				logger.Info().Str("reason_string", d.Properties.ReasonString).Msg("pubsub: server requested disconnect")
+			} else {
+				logger.Info().Uint8("reason_code", uint8(d.ReasonCode)).Msg("pubsub server requested disconnect")
+			}
 		},
 	}
 
