@@ -197,7 +197,7 @@ monitorLoop:
 			continue
 		}
 
-		// Now start a varnishlog parser for each container matching our naming convention.
+		// Now start a vinyllog parser for each container matching our naming convention.
 		for _, ctr := range containers {
 			for _, name := range ctr.Names {
 				// The docker API returns names with a leading
@@ -208,10 +208,10 @@ monitorLoop:
 
 				if strings.HasPrefix(name, containerPrefix) && strings.Contains(name, containerQualifier) {
 					if !mc.isMonitored(name) {
-						logger.Info().Str("name", name).Str("id", ctr.ID).Str("image", ctr.Image).Str("status", ctr.Status).Msg("found unmonitored SUNET CDN varnish container, starting varnishlog")
+						logger.Info().Str("name", name).Str("id", ctr.ID).Str("image", ctr.Image).Str("status", ctr.Status).Msg("found unmonitored SUNET CDN vinyl container, starting vinyllog")
 						mc.add(name, ctr.ID)
 						wg.Add(1)
-						go varnishlogReader(ctx, name, ctr.ID, wg, msgChan, logger, sender, debug, dockerClient, mc)
+						go vinyllogReader(ctx, name, ctr.ID, wg, msgChan, logger, sender, debug, dockerClient, mc)
 					}
 				}
 			}
@@ -360,7 +360,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 	// -   ReqHeader      user-agent: curl/8.4.0
 	// -   ReqHeader      accept: */*
 	// -   ReqHeader      X-Forwarded-For: 192.168.15.85
-	// -   ReqHeader      Via: 1.1 cdn-test-cache-1 (Varnish/7.4)
+	// -   BereqHeader    Via: 1.1 41c7e5dc3a3e (Vinyl-Cache/9.1)
 	// -   ReqHeader      X-Forwarded-Proto: https
 	// -   End
 
@@ -370,7 +370,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 	}
 
 	// Variables that will need to be reset any time we read a new
-	// varnishlog header, see RESET comment below.
+	// vinyllog header, see RESET comment below.
 	var reqURL string
 	var header http.Header
 	var clientIP netip.Addr
@@ -379,15 +379,15 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 	for scanner.Scan() {
 		text := scanner.Text()
 		if debug {
-			fmt.Printf("varnishlog line: %s\n", text)
+			fmt.Printf("vinyllog line: %s\n", text)
 		}
 		if strings.HasPrefix(text, "*") {
 			if seenHeader {
-				logger.Fatal().Msg("found new varnishlog header before seeing 'End' of previous entry, this is odd")
+				logger.Fatal().Msg("found new vinyllog header before seeing 'End' of previous entry, this is odd")
 			}
 
 			if debug {
-				logger.Debug().Msg("found varnishlog header, resetting variables")
+				logger.Debug().Msg("found vinyllog header, resetting variables")
 			}
 			seenHeader = true
 
@@ -409,7 +409,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 				// example result: []string{"-", "", "", "ReqHeader", "", "", "", "", "", "user-agent: curl/8.4.0"}
 				fields := strings.SplitN(text, " ", 10)
 
-				// Because varnishlog adds spaces to make
+				// Because vinyllog adds spaces to make
 				// pretty columns it is possible there is
 				// leftover leading space in the value. Clean
 				// that up.
@@ -421,7 +421,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 					return r == ' '
 				})
 				if debug {
-					logger.Debug().Str("varnishlog_tag", fields[fieldMap["tag"]]).Str("varnishlog_value", trimmedValue).Msg("varnishlog fields")
+					logger.Debug().Str("vinyllog_tag", fields[fieldMap["tag"]]).Str("vinyllog_value", trimmedValue).Msg("vinyllog fields")
 				}
 
 				switch fields[fieldMap["tag"]] {
@@ -540,7 +540,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 		} else if text == "^C" {
 			// Do nothing, if we simulate the sending of Ctrl+C this character will appear
 		} else {
-			logger.Error().Str("varnishlog_line", text).Msg("found unexpected varnishlog line")
+			logger.Error().Str("vinyllog_line", text).Msg("found unexpected vinyllog line")
 		}
 	}
 
@@ -552,7 +552,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 	return nil
 }
 
-func varnishlogReader(ctx context.Context, containerName string, containerID string, wg *sync.WaitGroup, msgChan chan []byte, logger zerolog.Logger, sender string, debug bool, dockerClient *client.Client, mc *monitoredContainers) {
+func vinyllogReader(ctx context.Context, containerName string, containerID string, wg *sync.WaitGroup, msgChan chan []byte, logger zerolog.Logger, sender string, debug bool, dockerClient *client.Client, mc *monitoredContainers) {
 	defer wg.Done()
 
 	defer func() {
@@ -560,16 +560,16 @@ func varnishlogReader(ctx context.Context, containerName string, containerID str
 		mc.del(containerName)
 	}()
 
-	varnishlogCmd := []string{"varnishlog", "-n", "/var/lib/varnish/varnishd", "-q", `ReqMethod eq "PURGE" and RespStatus == 200 and ReqURL`, "-i", "Begin,ReqHeader,ReqURL,ReqStart,End"}
+	vinyllogCmd := []string{"vinyllog", "-n", "/var/lib/vinyl-cache/vinyld", "-q", `ReqMethod eq "PURGE" and RespStatus == 200 and ReqURL`, "-i", "Begin,ReqHeader,ReqURL,ReqStart,End"}
 
-	err := dockerExec(ctx, dockerClient, containerID, varnishlogCmd, logger, debug, msgChan, sender, containerName)
+	err := dockerExec(ctx, dockerClient, containerID, vinyllogCmd, logger, debug, msgChan, sender, containerName)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
 			logger.Fatal().Err(err).Msg("dockerExec failed")
 		}
 	}
 
-	logger.Info().Str("name", containerName).Msg("varnishlogReader: exiting")
+	logger.Info().Str("name", containerName).Msg("vinyllogReader: exiting")
 }
 
 func setupMQTT(ctx context.Context, debug bool, logger *zerolog.Logger, logDir string, hostname string, serverURL *url.URL, tlsConfig *tls.Config, subTopic string, handleLocalMessages bool) (*autopaho.ConnectionManager, chan *paho.Publish, error) {
@@ -728,8 +728,8 @@ func main() {
 	mqttServerString := flag.String("mqtt-server", "tls://localhost:8883", "the MQTT server we connect to")
 	httpServerAddr := flag.String("http-server-addr", "127.0.0.1:2112", "Address to bind HTTP server to")
 	handleLocalMessages := flag.Bool("danger-handle-local-messages", false, "Handle messages sent by ourselves, should only be enabled for testing")
-	containerPrefix := flag.String("container-prefix", "sunet-cdn-agent_cache_", "Container name prefix for things we attach varnishlog to")
-	containerQualifier := flag.String("container-qualifier", "-varnish-", "Additional container name contents for things we attach varnishlog to")
+	containerPrefix := flag.String("container-prefix", "sunet-cdn-agent_cache_", "Container name prefix for things we attach vinyllog to")
+	containerQualifier := flag.String("container-qualifier", "-vinyl-", "Additional container name contents for things we attach vinyllog to")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
