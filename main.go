@@ -23,14 +23,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/eclipse/paho.golang/autopaho"
 	"github.com/eclipse/paho.golang/autopaho/queue/file"
 	"github.com/eclipse/paho.golang/paho"
 	"github.com/fsnotify/fsnotify"
 	"github.com/justinas/alice"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/client"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
@@ -191,14 +190,14 @@ func containerMonitor(ctx context.Context, wg *sync.WaitGroup, msgChan chan []by
 
 monitorLoop:
 	for {
-		containers, err := dockerClient.ContainerList(context.Background(), container.ListOptions{})
+		containers, err := dockerClient.ContainerList(context.Background(), client.ContainerListOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("unable to list containers")
 			continue
 		}
 
 		// Now start a vinyllog parser for each container matching our naming convention.
-		for _, ctr := range containers {
+		for _, ctr := range containers.Items {
 			for _, name := range ctr.Names {
 				// The docker API returns names with a leading
 				// slash ("/"), which is not visible when
@@ -230,7 +229,7 @@ monitorLoop:
 // https://stackoverflow.com/questions/52774830/docker-exec-command-from-golang-api
 // https://github.com/moby/moby/blob/8e610b2b55bfd1bfa9436ab110d311f5e8a74dcb/integration/internal/container/exec.go#L38
 func dockerExec(ctx context.Context, cli client.APIClient, id string, cmd []string, logger zerolog.Logger, debug bool, msgChan chan []byte, sender string, containerName string) error {
-	execConfig := container.ExecOptions{
+	execConfig := client.ExecCreateOptions{
 		AttachStdout: true,
 		AttachStderr: true,
 		Cmd:          cmd,
@@ -249,17 +248,17 @@ func dockerExec(ctx context.Context, cli client.APIClient, id string, cmd []stri
 		// End-of-Text (ETX) byte (0x3) to stdin, causing the TTY to
 		// SIGINT the process for us.
 		AttachStdin: true,
-		Tty:         true,
+		TTY:         true,
 	}
 
-	cresp, err := cli.ContainerExecCreate(ctx, id, execConfig)
+	cresp, err := cli.ExecCreate(ctx, id, execConfig)
 	if err != nil {
 		return fmt.Errorf("dockerExec: unable to create exec: %w", err)
 	}
 	execID := cresp.ID
 
 	// Start the process
-	aresp, err := cli.ContainerExecAttach(ctx, execID, container.ExecAttachOptions{})
+	aresp, err := cli.ExecAttach(ctx, execID, client.ExecAttachOptions{})
 	if err != nil {
 		return fmt.Errorf("dockerExec: unable to attach to exec: %w", err)
 	}
@@ -267,7 +266,7 @@ func dockerExec(ctx context.Context, cli client.APIClient, id string, cmd []stri
 
 	// Have the process shut down if needed
 	defer func() {
-		iresp, err := cli.ContainerExecInspect(context.Background(), execID)
+		iresp, err := cli.ExecInspect(context.Background(), execID, client.ExecInspectOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("unable to inspect process in container")
 			return
@@ -288,7 +287,7 @@ func dockerExec(ctx context.Context, cli client.APIClient, id string, cmd []stri
 		maxAttempts := 10
 		for range maxAttempts {
 			// Wait until the process has exited
-			iresp, err := cli.ContainerExecInspect(context.Background(), execID)
+			iresp, err := cli.ExecInspect(context.Background(), execID, client.ExecInspectOptions{})
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -901,7 +900,7 @@ func main() {
 	wg.Add(1)
 	go messageSubscriber(ctx, &wg, subMsgChan, logger, sender, *debug, *handleLocalMessages)
 
-	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	dockerClient, err := client.New(client.FromEnv)
 	if err != nil {
 		panic(err)
 	}
