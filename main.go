@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,12 +13,14 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -70,7 +73,136 @@ type purgeMessage struct {
 	Header        http.Header
 	Sender        string
 	ContainerName string
+	ClientIP      netip.Addr
+	ClientTLS     bool
 }
+
+// Headers that are never propagated to other nodes. Credentials and
+// per-client session state have no place in a cache purge, and
+// forwarding them would store them in the MQTT queue and broker.
+// Hop-by-hop headers describe the original connection, not the request.
+// Keys must be in canonical form (http.CanonicalHeaderKey).
+//
+// Headers nominated by a Connection header are deliberately propagated.
+// Vinyl keeps them visible to VCL and only filters them when forwarding
+// to a backend, so removing them would make peers evaluate a different
+// request than the original node. Honoring Connection here would also let
+// the sender strip arbitrary headers, such as a purge key, from the
+// propagated copy
+var unpropagatedHeaders = map[string]bool{
+	"Authorization":       true,
+	"Proxy-Authorization": true,
+	"Cookie":              true,
+	"Connection":          true,
+	"Keep-Alive":          true,
+	"Proxy-Connection":    true,
+	"Transfer-Encoding":   true,
+	"Te":                  true,
+	"Upgrade":             true,
+	"Content-Length":      true,
+	"Trailer":             true,
+}
+
+// stripLastListEntry removes the entry Vinyl's core appended to a
+// list-valued header, either at the end of the last line or as a line
+// of its own. The receiving node's core appends the same entry again,
+// so without this X-Forwarded-For would contain the client IP twice.
+func stripLastListEntry(h http.Header, key string) {
+	key = http.CanonicalHeaderKey(key)
+	if len(h[key]) == 0 {
+		return
+	}
+	last := len(h[key]) - 1
+	line := h[key][last]
+
+	// Appended to an existing line: "a, b" -> "a"
+	if i := strings.LastIndex(line, ","); i >= 0 {
+		h[key][last] = strings.TrimSpace(line[:i])
+		return
+	}
+
+	// A line of its own: drop the line.
+	h[key] = h[key][:last]
+
+	// If this was the only line, drop the key entirely.
+	if len(h[key]) == 0 {
+		h.Del(key)
+	}
+}
+
+// removeHeaderValue removes one line with exactly this value, applying
+// a single ReqUnset entry from vinyllog.
+func removeHeaderValue(h http.Header, key, value string) {
+	key = http.CanonicalHeaderKey(key)
+	i := slices.Index(h[key], value)
+	if i < 0 {
+		return
+	}
+	h[key] = slices.Delete(h[key], i, i+1)
+	if len(h[key]) == 0 {
+		h.Del(key)
+	}
+}
+
+// hostSocketPath maps socketPath, a path inside the named container, to
+// the corresponding path on the host using the container's mounts.
+func hostSocketPath(ctx context.Context, dockerClient *client.Client, containerName string, socketPath string) (string, error) {
+	res, err := dockerClient.ContainerInspect(ctx, containerName, client.ContainerInspectOptions{})
+	if err != nil {
+		return "", fmt.Errorf("unable to inspect container %q: %w", containerName, err)
+	}
+
+	var hostPath string
+	bestMatchLength := -1
+	for _, m := range res.Container.Mounts {
+		destination := filepath.Clean(m.Destination)
+		rel, err := filepath.Rel(destination, socketPath)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+			continue
+		}
+		if len(destination) > bestMatchLength {
+			hostPath = filepath.Join(m.Source, rel)
+			bestMatchLength = len(destination)
+		}
+	}
+	if bestMatchLength >= 0 {
+		return hostPath, nil
+	}
+
+	return "", fmt.Errorf("no mount in container %q contains %s", containerName, socketPath)
+}
+
+// dialUnixLongPath connects to a Unix socket whose path may exceed the
+// 107-character sun_path limit. It opens the socket's directory and
+// connects via /proc/self/fd/<fd>/<name>, a short path to the same file.
+// Linux-only.
+func dialUnixLongPath(ctx context.Context, logger zerolog.Logger, path string) (net.Conn, error) {
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return nil, fmt.Errorf("unable to open socket directory: %w", err)
+	}
+	defer func() {
+		if cErr := dir.Close(); cErr != nil {
+			logger.Err(cErr).Msg("unable to close unix dial dir")
+		}
+	}()
+
+	shortPath := fmt.Sprintf("/proc/self/fd/%d/%s", dir.Fd(), filepath.Base(path))
+
+	var d net.Dialer
+	return d.DialContext(ctx, "unix", shortPath)
+}
+
+// Headers Vinyl's core appends its own entry to before vcl_recv. The
+// receiving node appends its own entry again, so the last entry is
+// stripped before publishing.
+var coreAppendedHeaders = []string{"X-Forwarded-For", "Via"}
+
+const purgerOriginHeader = "Sunet-Cdn-Purger-Origin"
+
+// Name of the vinyl listener the purger sends purges to. Must match the
+// name in vinyl's -a argument, e.g. -a purger=/purger/unix-sockets/vinyl
+const purgerListenerName = "purger"
 
 func messagePublisher(ctx context.Context, wg *sync.WaitGroup, payloadChan chan []byte, logger zerolog.Logger, cm *autopaho.ConnectionManager, pubTopic string) {
 	defer wg.Done()
@@ -96,12 +228,10 @@ func messagePublisher(ctx context.Context, wg *sync.WaitGroup, payloadChan chan 
 	logger.Info().Msg("messagePublisher: exiting")
 }
 
-func messageSubscriber(ctx context.Context, wg *sync.WaitGroup, msgChan chan *paho.Publish, logger zerolog.Logger, sender string, debug bool, handleLocalMessages bool) {
+func messageSubscriber(ctx context.Context, wg *sync.WaitGroup, msgChan chan *paho.Publish, logger zerolog.Logger, sender string, debug bool, handleLocalMessages bool, socketPath string, dockerClient *client.Client) {
 	defer wg.Done()
 
 	var purgerWg sync.WaitGroup
-
-	purgeClient := http.Client{}
 
 	for msg := range msgChan {
 		logger.Info().Str("topic", msg.Topic).Msg("got message from queue")
@@ -142,7 +272,7 @@ func messageSubscriber(ctx context.Context, wg *sync.WaitGroup, msgChan chan *pa
 		}
 
 		purgerWg.Add(1)
-		go sendLocalPurge(ctx, &purgerWg, logger, purgeClient, pm)
+		go sendLocalPurge(ctx, &purgerWg, logger, dockerClient, socketPath, pm)
 	}
 
 	logger.Info().Msg("messageSubscriber: waiting for outstanding local purge requests")
@@ -153,27 +283,68 @@ func messageSubscriber(ctx context.Context, wg *sync.WaitGroup, msgChan chan *pa
 
 // This is the function that will be called to purge our local cache based on
 // the contents of a purge message from another cache node.
-func sendLocalPurge(ctx context.Context, wg *sync.WaitGroup, logger zerolog.Logger, purgeClient http.Client, pm purgeMessage) {
+func sendLocalPurge(ctx context.Context, wg *sync.WaitGroup, logger zerolog.Logger, dockerClient *client.Client, socketPath string, pm purgeMessage) {
 	defer wg.Done()
 
-	req, err := http.NewRequestWithContext(ctx, "PURGE", "http://127.0.0.1:6081", nil)
-	if err != nil {
-		logger.Error().Err(err).Msg("unable to create HTTP request")
+	if pm.URL == nil {
+		logger.Error().Msg("purge message has no URL, skipping")
 		return
 	}
 
-	// Mimic settings from the initial request recieved from a client
-	req.Header = pm.Header
-	req.URL.Path = pm.URL.Path
+	req, err := http.NewRequestWithContext(ctx, "PURGE", "http://vinyl"+pm.URL.RequestURI(), nil)
+	if err != nil {
+		logger.Err(err).Msg("unable to create HTTP request")
+		return
+	}
+
+	req.Header = pm.Header.Clone()
+	if req.Header == nil {
+		req.Header = http.Header{}
+	}
+
+	// Go's client ignores Host in req.Header, it must be set on req.Host.
+	req.Host = pm.Header.Get("Host")
+	req.Header.Del("Host")
+
+	// Go sends a default User-Agent when the header is absent. A present
+	// but empty entry suppresses it, so absent stays absent.
+	if _, ok := req.Header["User-Agent"]; !ok {
+		req.Header["User-Agent"] = nil
+	}
+
+	// Lets runParser on this node recognize the purge as ours and not
+	// publish it again.
+	req.Header.Set(purgerOriginHeader, pm.Sender)
+
+	hostPath, err := hostSocketPath(ctx, dockerClient, pm.ContainerName, socketPath)
+	if err != nil {
+		logger.Error().Err(err).Str("container", pm.ContainerName).Msg("unable to find host vinyl socket for purge")
+		return
+	}
+
+	purgeClient, err := newPurgeClient(logger, hostPath, pm.ClientIP, pm.ClientTLS)
+	if err != nil {
+		logger.Err(err).Msg("unable to create purge client")
+		return
+	}
+	// The client is only used for this purge, close its connection when
+	// done instead of leaving it idle in the pool.
+	defer purgeClient.CloseIdleConnections()
 
 	resp, err := purgeClient.Do(req)
 	if err != nil {
-		logger.Error().Err(err).Msg("unable to send purge request")
+		logger.Err(err).Msg("unable to send purge request")
 		return
 	}
+	defer func() {
+		if cErr := resp.Body.Close(); cErr != nil {
+			logger.Err(cErr).Msg("unable to close local purge body")
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
-		logger.Error().Int("status_code", resp.StatusCode).Msg("failed sending local purge")
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		logger.Error().Int("status_code", resp.StatusCode).Str("body", string(body)).Msg("failed sending local purge")
 	}
 }
 
@@ -351,16 +522,20 @@ func dockerExec(ctx context.Context, cli client.APIClient, id string, cmd []stri
 func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgChan chan []byte, sender string, containerName string) error {
 	var err error
 
-	// *   << Request  >> 1574921
-	// -   Begin          req 1574920 rxreq
-	// -   ReqStart       192.168.15.85 27017 a1
+	// *   << Request  >> 2392453
+	// -   Begin          req 2392452 rxreq
+	// -   ReqStart       192.168.15.85 62353 purger
 	// -   ReqURL         /
-	// -   ReqHeader      host: www.example.com
-	// -   ReqHeader      user-agent: curl/8.4.0
+	// -   ReqHeader      host: cdn-test-backend.cdn.sunet.se
+	// -   ReqHeader      user-agent: curl/8.7.1
 	// -   ReqHeader      accept: */*
 	// -   ReqHeader      X-Forwarded-For: 192.168.15.85
-	// -   BereqHeader    Via: 1.1 41c7e5dc3a3e (Vinyl-Cache/9.1)
+	// -   ReqHeader      Via: 1.1 381a22f21525 (Vinyl-Cache/9.1)
+	// -   VCL_call       RECV
 	// -   ReqHeader      X-Forwarded-Proto: https
+	// -   VCL_call       HASH
+	// -   VCL_call       PURGE
+	// -   VCL_call       SYNTH
 	// -   End
 
 	fieldMap := map[string]int{
@@ -373,8 +548,13 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 	var reqURL string
 	var header http.Header
 	var clientIP netip.Addr
-
+	var fromPurger bool     // request was sent by a sunet-cdn-purger
+	var purgerOrigin string // sender name from the marker header
+	var recvStarted bool    // vcl_recv has started, stop collecting
+	var clientTLS bool
+	var forwardedProtoSeen bool
 	seenHeader := false
+
 	for scanner.Scan() {
 		text := scanner.Text()
 		if debug {
@@ -395,6 +575,11 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 			reqURL = ""
 			header = http.Header{}
 			clientIP = netip.Addr{}
+			fromPurger = false
+			purgerOrigin = ""
+			recvStarted = false
+			clientTLS = false
+			forwardedProtoSeen = false
 		} else if strings.HasPrefix(text, "-") {
 			if !seenHeader {
 				logger.Fatal().Msg("got log message without seeing header first, this is odd")
@@ -423,7 +608,8 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 					logger.Debug().Str("vinyllog_tag", fields[fieldMap["tag"]]).Str("vinyllog_value", trimmedValue).Msg("vinyllog fields")
 				}
 
-				switch fields[fieldMap["tag"]] {
+				tag := fields[fieldMap["tag"]]
+				switch tag {
 				case "ReqStart":
 					if debug {
 						logger.Debug().Str("trimmed_value", trimmedValue).Msg("got ReqStart")
@@ -434,35 +620,70 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 					if err != nil {
 						logger.Error().Err(err).Msg("unable to parse ReqStart IP address")
 					}
+					// Only the purger can connect to this listener, and unlike a
+					// header the listener name can't be set by a client.
+					if len(reqStartFields) >= 3 && reqStartFields[2] == purgerListenerName {
+						fromPurger = true
+					}
+				case "VCL_call":
+					// Everything logged before the first vcl_recv is the
+					// request as received; later changes come from the
+					// tenant VCL and will be reapplied by the receiving node.
+					if trimmedValue == "RECV" {
+						recvStarted = true
+					}
 				case "ReqURL":
 					if debug {
 						logger.Debug().Str("url", trimmedValue).Msg("got URL: %s\n")
 					}
-					reqURL = trimmedValue
-				case "ReqHeader":
-					headerParts := strings.SplitN(trimmedValue, ": ", 2)
-					if len(headerParts) != 2 {
-						logger.Error().Msg("unable to split header string")
+					if !recvStarted {
+						reqURL = trimmedValue
+					}
+				case "ReqHeader", "ReqUnset":
+					if recvStarted {
+						// The manager block in vcl_recv sets
+						// X-Forwarded-Proto from proxy.is_ssl(); the first
+						// value set after RECV is the TLS state.
+						if tag == "ReqHeader" && !forwardedProtoSeen {
+							if key, value, ok := strings.Cut(trimmedValue, ":"); ok && strings.EqualFold(key, "X-Forwarded-Proto") {
+								clientTLS = strings.TrimLeft(value, " ") == "https"
+								forwardedProtoSeen = true
+							}
+						}
 						continue
 					}
-					headerKey := headerParts[0]
-					headerValue := headerParts[1]
+					key, value, ok := strings.Cut(trimmedValue, ":")
+					if !ok {
+						logger.Error().Str("value", trimmedValue).Msg("unable to split header string")
+						continue
+					}
+					value = strings.TrimLeft(value, " ")
 
-					// Filter on what header fields we want to
-					// carry with us in the message.
-					switch headerKey {
-					case "xkey":
-						header.Add(headerKey, headerValue)
-					case "host":
-						header.Add(headerKey, headerValue)
-					case "X-Forwarded-Proto":
-						header.Add(headerKey, headerValue)
+					if strings.EqualFold(key, purgerOriginHeader) {
+						// Informational only, detection uses the listener name.
+						purgerOrigin = value
+						continue
+					}
+					if unpropagatedHeaders[http.CanonicalHeaderKey(key)] {
+						continue
+					}
+
+					if tag == "ReqHeader" {
+						header.Add(key, value)
+					} else {
+						removeHeaderValue(header, key, value)
 					}
 				case "End":
 					// The entry is complete, finish
 					// filling in struct and send it to
 					// MQTT.
 					seenHeader = false
+
+					if fromPurger {
+						logger.Info().Str("origin_sender", purgerOrigin).Msg("not sending MQTT message for purge request sent by sunet-cdn-purger")
+						continue
+					}
+
 					if clientIP.IsLoopback() {
 						// In order to not create loops
 						// we ignore PURGE requests
@@ -481,22 +702,24 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 						continue
 					}
 
-					pm := purgeMessage{}
-
-					pm.Sender = sender
-					pm.Header = header
-					pm.ContainerName = containerName
-
-					urlString := ""
-
-					if protos := header.Values("X-Forwarded-Proto"); protos != nil {
-						if len(protos) != 1 {
-							logger.Error().Int("num_protos", len(protos)).Msg("unexpected number of X-Forwarded-Proto header fields found")
-						} else {
-							urlString += protos[0] + "://"
-						}
+					if !forwardedProtoSeen {
+						logger.Warn().Msg("no X-Forwarded-Proto set in vcl_recv, propagating purge as plain HTTP")
 					}
 
+					for _, k := range coreAppendedHeaders {
+						stripLastListEntry(header, k)
+					}
+
+					pm := purgeMessage{
+						Sender:        sender,
+						Header:        header,
+						ContainerName: containerName,
+						ClientIP:      clientIP,
+						ClientTLS:     clientTLS,
+					}
+
+					// Varnish sees all requests as http:// since TLS is terminated by haproxy
+					urlString := "http://"
 					if hosts := header.Values("host"); hosts != nil {
 						if len(hosts) != 1 {
 							logger.Error().Int("num_hosts", len(hosts)).Msg("unexpected number of host header fields found")
@@ -551,6 +774,90 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 	return nil
 }
 
+// https://www.haproxy.org/download/3.1/doc/proxy-protocol.txt
+var proxyV2Signature = []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
+
+// proxyV2Header builds a PROXY protocol v2 header for src. When isTLS is
+// set it includes a PP2_TYPE_SSL TLV so proxy.is_ssl() is true in VCL.
+func proxyV2Header(src netip.Addr, isTLS bool) ([]byte, error) {
+	src = src.Unmap()
+
+	var family byte
+	var body []byte
+	if src.Is4() {
+		family = 0x11 // AF_INET, STREAM
+		s, d := src.As4(), netip.MustParseAddr("127.0.0.1").As4()
+		body = append(body, s[:]...)
+		body = append(body, d[:]...)
+	} else {
+		family = 0x21 // AF_INET6, STREAM
+		s, d := src.As16(), netip.IPv6Loopback().As16()
+		body = append(body, s[:]...)
+		body = append(body, d[:]...)
+	}
+
+	dstPort := uint16(80)
+	if isTLS {
+		dstPort = 443
+	}
+	body = binary.BigEndian.AppendUint16(body, 40000) // source port
+	body = binary.BigEndian.AppendUint16(body, dstPort)
+
+	if isTLS {
+		// PP2_TYPE_SSL (0x20), length 5: client flags PP2_CLIENT_SSL,
+		// then a non-zero verify result (no verified client certificate).
+		body = append(body, 0x20, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x01)
+	}
+
+	h := append([]byte{}, proxyV2Signature...)
+	h = append(h, 0x21, family) // version 2, PROXY command
+
+	// G115 (CWE-190): integer overflow conversion int -> uint16 (Confidence: MEDIUM, Severity: HIGH)
+	bodyLen := len(body)
+	if bodyLen > math.MaxUint16 {
+		return nil, fmt.Errorf("body length is too large for uint16")
+	}
+	h = binary.BigEndian.AppendUint16(h, uint16(bodyLen))
+	return append(h, body...), nil
+}
+
+// newPurgeClient returns a client whose connections start with a PROXY
+// header for src. Vinyl reads the PROXY header once per connection and
+// applies it to every request sent on it, so a client must only be used
+// for a single purge and never shared, otherwise a later purge could be
+// treated as coming from an earlier purge's client.
+func newPurgeClient(logger zerolog.Logger, socketPath string, src netip.Addr, isTLS bool) (*http.Client, error) {
+	if !src.IsValid() {
+		return nil, fmt.Errorf("purge message has no valid client IP")
+	}
+	proxyHeader, err := proxyV2Header(src, isTLS)
+	if err != nil {
+		return nil, err
+	}
+
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			// Don't add "Accept-Encoding: gzip", the request should only
+			// carry the headers the original had.
+			DisableCompression: true,
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				conn, err := dialUnixLongPath(ctx, logger, socketPath)
+				if err != nil {
+					return nil, err
+				}
+				if _, err := conn.Write(proxyHeader); err != nil {
+					if cErr := conn.Close(); cErr != nil {
+						logger.Err(cErr).Msg("unable to close unix dial context")
+					}
+					return nil, err
+				}
+				return conn, nil
+			},
+		},
+	}, nil
+}
+
 func vinyllogReader(ctx context.Context, containerName string, containerID string, wg *sync.WaitGroup, msgChan chan []byte, logger zerolog.Logger, sender string, debug bool, dockerClient *client.Client, mc *monitoredContainers) {
 	defer wg.Done()
 
@@ -559,7 +866,7 @@ func vinyllogReader(ctx context.Context, containerName string, containerID strin
 		mc.del(containerName)
 	}()
 
-	vinyllogCmd := []string{"vinyllog", "-n", "/var/lib/vinyl-cache/vinyld", "-q", `ReqMethod eq "PURGE" and RespStatus == 200 and ReqURL`, "-i", "Begin,ReqHeader,ReqURL,ReqStart,End"}
+	vinyllogCmd := []string{"vinyllog", "-n", "/var/lib/vinyl-cache/vinyld", "-q", `ReqMethod eq "PURGE" and RespStatus == 200 and ReqURL`, "-i", "Begin,ReqHeader,ReqUnset,ReqURL,ReqStart,VCL_call,End"}
 
 	err := dockerExec(ctx, dockerClient, containerID, vinyllogCmd, logger, debug, msgChan, sender, containerName)
 	if err != nil {
@@ -729,6 +1036,7 @@ func main() {
 	handleLocalMessages := flag.Bool("danger-handle-local-messages", false, "Handle messages sent by ourselves, should only be enabled for testing")
 	containerPrefix := flag.String("container-prefix", "sunet-cdn-agent_cache_", "Container name prefix for things we attach vinyllog to")
 	containerQualifier := flag.String("container-qualifier", "-vinyl-", "Additional container name contents for things we attach vinyllog to")
+	socketPath := flag.String("socket-path", "/purger/unix-sockets/vinyl", "Unix socket of the local vinyl PROXY listener used for sending purges")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -893,13 +1201,6 @@ func main() {
 		close(idleConnsClosed)
 	}()
 
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go messagePublisher(ctx, &wg, pubPayloadChan, logger, mqttCM, *mqttPubTopic)
-	wg.Add(1)
-	go messageSubscriber(ctx, &wg, subMsgChan, logger, sender, *debug, *handleLocalMessages)
-
 	dockerClient, err := client.New(client.FromEnv)
 	if err != nil {
 		panic(err)
@@ -911,6 +1212,12 @@ func main() {
 		}
 	}()
 
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go messagePublisher(ctx, &wg, pubPayloadChan, logger, mqttCM, *mqttPubTopic)
+	wg.Add(1)
+	go messageSubscriber(ctx, &wg, subMsgChan, logger, sender, *debug, *handleLocalMessages, *socketPath, dockerClient)
 	wg.Add(1)
 	go containerMonitor(ctx, &wg, pubPayloadChan, logger, sender, *debug, dockerClient, *containerPrefix, *containerQualifier)
 
