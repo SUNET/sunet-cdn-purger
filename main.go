@@ -312,8 +312,9 @@ func sendLocalPurge(ctx context.Context, wg *sync.WaitGroup, logger zerolog.Logg
 		req.Header["User-Agent"] = nil
 	}
 
-	// Lets runParser on this node recognize the purge as ours and not
-	// publish it again.
+	// Record which node the purge originated from, so runParser on this
+	// node can include it in its log. Loop prevention uses the listener
+	// name instead, so this header has no effect on publishing.
 	req.Header.Set(purgerOriginHeader, pm.Sender)
 
 	hostPath, err := hostSocketPath(ctx, dockerClient, pm.ContainerName, socketPath)
