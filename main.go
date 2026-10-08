@@ -314,7 +314,8 @@ func sendLocalPurge(ctx context.Context, wg *sync.WaitGroup, logger zerolog.Logg
 
 	// Record which node the purge originated from, so runParser on this
 	// node can include it in its log. Loop prevention uses the listener
-	// name instead, so this header has no effect on publishing.
+	// name (purgerListenerName) instead, so this header has no effect on
+	// publishing.
 	req.Header.Set(purgerOriginHeader, pm.Sender)
 
 	hostPath, err := hostSocketPath(ctx, dockerClient, pm.ContainerName, socketPath)
@@ -661,7 +662,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 					value = strings.TrimLeft(value, " ")
 
 					if strings.EqualFold(key, purgerOriginHeader) {
-						// Informational only, detection uses the listener name.
+						// Informational only, detection uses purgerListenerName.
 						purgerOrigin = value
 						continue
 					}
@@ -719,7 +720,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 						ClientTLS:     clientTLS,
 					}
 
-					// Varnish sees all requests as http:// since TLS is terminated by haproxy
+					// Vinyl sees all requests as http:// since TLS is terminated by haproxy
 					urlString := "http://"
 					if hosts := header.Values("host"); hosts != nil {
 						if len(hosts) != 1 {
