@@ -68,7 +68,10 @@ func (mc *monitoredContainers) isMonitored(name string) bool {
 	return false
 }
 
+// purgeMessage describes a PURGE or BAN request handled by a node, so other
+// nodes can replay it.
 type purgeMessage struct {
+	Method        string // one of propagatedMethods
 	URL           *url.URL
 	Header        http.Header
 	Sender        string
@@ -76,6 +79,11 @@ type purgeMessage struct {
 	ClientIP      netip.Addr
 	ClientTLS     bool
 }
+
+// HTTP methods whose successful requests are propagated to other nodes and
+// replayed there with the same method. Only these are ever sent to the
+// local vinyl, whatever a message asks for.
+var propagatedMethods = []string{"PURGE", "BAN"}
 
 // Headers that are never propagated to other nodes. Credentials and
 // per-client session state have no place in a cache purge, and
@@ -286,37 +294,11 @@ func messageSubscriber(ctx context.Context, wg *sync.WaitGroup, msgChan chan *pa
 func sendLocalPurge(ctx context.Context, wg *sync.WaitGroup, logger zerolog.Logger, dockerClient *client.Client, socketPath string, pm purgeMessage) {
 	defer wg.Done()
 
-	if pm.URL == nil {
-		logger.Error().Msg("purge message has no URL, skipping")
-		return
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "PURGE", "http://vinyl"+pm.URL.RequestURI(), nil)
+	req, err := newLocalRequest(ctx, pm)
 	if err != nil {
 		logger.Err(err).Msg("unable to create HTTP request")
 		return
 	}
-
-	req.Header = pm.Header.Clone()
-	if req.Header == nil {
-		req.Header = http.Header{}
-	}
-
-	// Go's client ignores Host in req.Header, it must be set on req.Host.
-	req.Host = pm.Header.Get("Host")
-	req.Header.Del("Host")
-
-	// Go sends a default User-Agent when the header is absent. A present
-	// but empty entry suppresses it, so absent stays absent.
-	if _, ok := req.Header["User-Agent"]; !ok {
-		req.Header["User-Agent"] = nil
-	}
-
-	// Record which node the purge originated from, so runParser on this
-	// node can include it in its log. Loop prevention uses the listener
-	// name (purgerListenerName) instead, so this header has no effect on
-	// publishing.
-	req.Header.Set(purgerOriginHeader, pm.Sender)
 
 	hostPath, err := hostSocketPath(ctx, dockerClient, pm.ContainerName, socketPath)
 	if err != nil {
@@ -346,8 +328,48 @@ func sendLocalPurge(ctx context.Context, wg *sync.WaitGroup, logger zerolog.Logg
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		logger.Error().Int("status_code", resp.StatusCode).Str("body", string(body)).Msg("failed sending local purge")
+		logger.Error().Str("method", pm.Method).Int("status_code", resp.StatusCode).Str("body", string(body)).Msg("failed sending local purge")
 	}
+}
+
+// newLocalRequest builds the request sent to the local vinyl, reproducing
+// the original request described by pm.
+func newLocalRequest(ctx context.Context, pm purgeMessage) (*http.Request, error) {
+	if !slices.Contains(propagatedMethods, pm.Method) {
+		return nil, fmt.Errorf("purge message has unsupported method %q", pm.Method)
+	}
+
+	if pm.URL == nil {
+		return nil, errors.New("purge message has no URL")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, pm.Method, "http://vinyl"+pm.URL.RequestURI(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header = pm.Header.Clone()
+	if req.Header == nil {
+		req.Header = http.Header{}
+	}
+
+	// Go's client ignores Host in req.Header, it must be set on req.Host.
+	req.Host = pm.Header.Get("Host")
+	req.Header.Del("Host")
+
+	// Go sends a default User-Agent when the header is absent. A present
+	// but empty entry suppresses it, so absent stays absent.
+	if _, ok := req.Header["User-Agent"]; !ok {
+		req.Header["User-Agent"] = nil
+	}
+
+	// Record which node the purge originated from, so runParser on this
+	// node can include it in its log. Loop prevention uses the listener
+	// name (purgerListenerName) instead, so this header has no effect on
+	// publishing.
+	req.Header.Set(purgerOriginHeader, pm.Sender)
+
+	return req, nil
 }
 
 func containerMonitor(ctx context.Context, wg *sync.WaitGroup, msgChan chan []byte, logger zerolog.Logger, sender string, debug bool, dockerClient *client.Client, containerPrefix string, containerQualifier string) {
@@ -527,6 +549,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 	// *   << Request  >> 2392453
 	// -   Begin          req 2392452 rxreq
 	// -   ReqStart       192.168.15.85 62353 purger
+	// -   ReqMethod      PURGE
 	// -   ReqURL         /
 	// -   ReqHeader      host: cdn-test-backend.cdn.sunet.se
 	// -   ReqHeader      user-agent: curl/8.7.1
@@ -547,6 +570,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 
 	// Variables that will need to be reset any time we read a new
 	// vinyllog header, see RESET comment below.
+	var reqMethod string
 	var reqURL string
 	var header http.Header
 	var clientIP netip.Addr
@@ -574,6 +598,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 
 			// RESET: Reset variables for new request we
 			// are about to parse
+			reqMethod = ""
 			reqURL = ""
 			header = http.Header{}
 			clientIP = netip.Addr{}
@@ -634,6 +659,10 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 					if trimmedValue == "RECV" {
 						recvStarted = true
 					}
+				case "ReqMethod":
+					if !recvStarted {
+						reqMethod = trimmedValue
+					}
 				case "ReqURL":
 					if debug {
 						logger.Debug().Str("url", trimmedValue).Msg("got URL: %s\n")
@@ -682,7 +711,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 					seenHeader = false
 
 					if fromPurger {
-						logger.Info().Str("origin_sender", purgerOrigin).Msg("not sending MQTT message for purge request sent by sunet-cdn-purger")
+						logger.Info().Str("method", reqMethod).Str("origin_sender", purgerOrigin).Msg("not sending MQTT message for purge request sent by sunet-cdn-purger")
 						continue
 					}
 
@@ -700,7 +729,16 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 						// similar, and we probably
 						// should not spread those
 						// either.
-						logger.Info().Str("client_ip", clientIP.String()).Msg("not sending MQTT message for purge request from localhost")
+						logger.Info().Str("method", reqMethod).Str("client_ip", clientIP.String()).Msg("not sending MQTT message for purge request from localhost")
+						continue
+					}
+
+					// The query also matches requests whose method
+					// was changed to PURGE or BAN by the VCL. Peers
+					// replay the request as received, so those
+					// can't be propagated.
+					if !slices.Contains(propagatedMethods, reqMethod) {
+						logger.Error().Str("method", reqMethod).Msg("not sending MQTT message for request received with unsupported method")
 						continue
 					}
 
@@ -713,6 +751,7 @@ func runParser(scanner *bufio.Scanner, logger zerolog.Logger, debug bool, msgCha
 					}
 
 					pm := purgeMessage{
+						Method:        reqMethod,
 						Sender:        sender,
 						Header:        header,
 						ContainerName: containerName,
@@ -860,6 +899,17 @@ func newPurgeClient(logger zerolog.Logger, socketPath string, src netip.Addr, is
 	}, nil
 }
 
+// vinyllogQuery returns the VSL query selecting successful requests using
+// one of propagatedMethods, e.g.
+// (ReqMethod eq "PURGE" or ReqMethod eq "BAN") and RespStatus == 200 and ReqURL
+func vinyllogQuery() string {
+	var methods []string
+	for _, m := range propagatedMethods {
+		methods = append(methods, fmt.Sprintf("ReqMethod eq %q", m))
+	}
+	return "(" + strings.Join(methods, " or ") + ") and RespStatus == 200 and ReqURL"
+}
+
 func vinyllogReader(ctx context.Context, containerName string, containerID string, wg *sync.WaitGroup, msgChan chan []byte, logger zerolog.Logger, sender string, debug bool, dockerClient *client.Client, mc *monitoredContainers) {
 	defer wg.Done()
 
@@ -868,7 +918,7 @@ func vinyllogReader(ctx context.Context, containerName string, containerID strin
 		mc.del(containerName)
 	}()
 
-	vinyllogCmd := []string{"vinyllog", "-n", "/var/lib/vinyl-cache/vinyld", "-q", `ReqMethod eq "PURGE" and RespStatus == 200 and ReqURL`, "-i", "Begin,ReqHeader,ReqUnset,ReqURL,ReqStart,VCL_call,End"}
+	vinyllogCmd := []string{"vinyllog", "-n", "/var/lib/vinyl-cache/vinyld", "-q", vinyllogQuery(), "-i", "Begin,ReqHeader,ReqUnset,ReqMethod,ReqURL,ReqStart,VCL_call,End"}
 
 	err := dockerExec(ctx, dockerClient, containerID, vinyllogCmd, logger, debug, msgChan, sender, containerName)
 	if err != nil {
@@ -1031,8 +1081,8 @@ func main() {
 	mqttClientKeyFile := flag.String("mqtt-client-key-file", "", "MQTT client key file")
 	mqttCAFile := flag.String("mqtt-ca-file", "", "MQTT trusted CA file, leave empty for OS default")
 	mqttQueueDir := flag.String("mqtt-queue-dir", "/var/cache/sunet-cdn-purger/mqtt", "MQTT message queue directory")
-	mqttPubTopic := flag.String("mqtt-pub-topic", "test/topic", "the topic we publish PURGE messages to")
-	mqttSubTopic := flag.String("mqtt-sub-topic", "test/topic", "the topic we subscribe to PURGE messages on")
+	mqttPubTopic := flag.String("mqtt-pub-topic", "test/topic", "the topic we publish PURGE and BAN messages to")
+	mqttSubTopic := flag.String("mqtt-sub-topic", "test/topic", "the topic we subscribe to PURGE and BAN messages on")
 	mqttServerString := flag.String("mqtt-server", "tls://localhost:8883", "the MQTT server we connect to")
 	httpServerAddr := flag.String("http-server-addr", "127.0.0.1:2112", "Address to bind HTTP server to")
 	handleLocalMessages := flag.Bool("danger-handle-local-messages", false, "Handle messages sent by ourselves, should only be enabled for testing")
