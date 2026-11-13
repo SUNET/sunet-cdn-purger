@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -372,7 +373,7 @@ func newLocalRequest(ctx context.Context, pm purgeMessage) (*http.Request, error
 	return req, nil
 }
 
-func containerMonitor(ctx context.Context, wg *sync.WaitGroup, msgChan chan []byte, logger zerolog.Logger, sender string, debug bool, dockerClient *client.Client, containerPrefix string, containerQualifier string) {
+func containerMonitor(ctx context.Context, wg *sync.WaitGroup, msgChan chan []byte, logger zerolog.Logger, sender string, debug bool, dockerClient *client.Client, containerPrefix string, containerQualifierRe *regexp.Regexp) {
 	defer wg.Done()
 
 	ticker := time.NewTicker(time.Second * 10)
@@ -400,7 +401,7 @@ monitorLoop:
 				// here as well to look the same.
 				name = strings.TrimPrefix(name, "/")
 
-				if strings.HasPrefix(name, containerPrefix) && strings.Contains(name, containerQualifier) {
+				if strings.HasPrefix(name, containerPrefix) && containerQualifierRe.MatchString(name) {
 					if !mc.isMonitored(name) {
 						logger.Info().Str("name", name).Str("id", ctr.ID).Str("image", ctr.Image).Str("status", ctr.Status).Msg("found unmonitored SUNET CDN vinyl container, starting vinyllog")
 						mc.add(name, ctr.ID)
@@ -1087,7 +1088,7 @@ func main() {
 	httpServerAddr := flag.String("http-server-addr", "127.0.0.1:2112", "Address to bind HTTP server to")
 	handleLocalMessages := flag.Bool("danger-handle-local-messages", false, "Handle messages sent by ourselves, should only be enabled for testing")
 	containerPrefix := flag.String("container-prefix", "sunet-cdn-agent_cache_", "Container name prefix for things we attach vinyllog to")
-	containerQualifier := flag.String("container-qualifier", "-vinyl-", "Additional container name contents for things we attach vinyllog to")
+	containerQualifier := flag.String("container-qualifier", "vinyl", "Additional container name contents for things we attach vinyllog to")
 	socketPath := flag.String("socket-path", "/purger/unix-sockets/vinyl", "Unix socket of the local vinyl PROXY listener used for sending purges")
 	flag.Parse()
 
@@ -1098,6 +1099,14 @@ func main() {
 		Timestamp().
 		Str("service", "sunet-cdn-purger").
 		Logger()
+
+	// Only match container names that end with the qualifier followed by a
+	// number. This is needed so the default qualifier matches "-vinyl-1"
+	// but not "-vinyl-exporter-1".
+	containerQualifierRe, err := regexp.Compile(fmt.Sprintf(`-%s-([0-9]+)$`, regexp.QuoteMeta(*containerQualifier)))
+	if err != nil {
+		logger.Fatal().Err(err).Msg("unable to compile regexp for containerQualifier")
+	}
 
 	sender, err := os.Hostname()
 	if err != nil {
@@ -1271,7 +1280,7 @@ func main() {
 	wg.Add(1)
 	go messageSubscriber(ctx, &wg, subMsgChan, logger, sender, *debug, *handleLocalMessages, *socketPath, dockerClient)
 	wg.Add(1)
-	go containerMonitor(ctx, &wg, pubPayloadChan, logger, sender, *debug, dockerClient, *containerPrefix, *containerQualifier)
+	go containerMonitor(ctx, &wg, pubPayloadChan, logger, sender, *debug, dockerClient, *containerPrefix, containerQualifierRe)
 
 	http.Handle("/metrics", mh)
 
